@@ -1,0 +1,28 @@
+# Environnement virtuel
+venv/
+.venv/
+env/
+
+# Données volumineuses (ne pas versionner — trop lourdes pour GitHub)
+*.geojson
+*.csv
+
+# Archives
+*.zip
+
+# Scripts internes de génération PDF
+generate_comparison_pdf.py
+generer_audit.py
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.DS_Store
+
+# Streamlit
+.streamlit/
+
+# IDE
+.vscode/
+.idea/
