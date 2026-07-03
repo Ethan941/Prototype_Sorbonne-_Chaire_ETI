@@ -1,6 +1,8 @@
 """Dashboard HQVS — Streamlit — 100% Python"""
 from __future__ import annotations
 from pathlib import Path
+import math
+import urllib.request
 
 import geopandas as gpd
 import pandas as pd
@@ -9,7 +11,11 @@ import plotly.express as px
 import streamlit as st
 
 # ── Config ─────────────────────────────────────────────────────────────────────
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR    = Path(__file__).parent / "data"
+RES_DIR     = Path(__file__).parent / "ressources"
+MARTIN_URL  = "https://martin-sete-etudiants.cartosphere.app"
+# Bounding box Sète (lon_min lat_min lon_max lat_max)
+_SETE_BB    = (3.555, 43.32, 3.72, 43.43)
 
 FUNCTIONS: dict[str, tuple[str, str, str]] = {
     "habiter":          ("Habiter",          "🏠", "#2563eb"),
@@ -127,9 +133,133 @@ def _norm_bool(s: pd.Series) -> pd.Series:
         return s.fillna(0).astype(bool)
     return s.astype(str).str.strip().str.lower().isin({"true", "1", "yes", "oui"})
 
-@st.cache_data(show_spinner="Chargement des isochrones…")
+# ── Martin MVT helpers ─────────────────────────────────────────────────────────
+def _tile_xy(lon: float, lat: float, z: int) -> tuple[int, int]:
+    n = 2 ** z
+    x = int((lon + 180) / 360 * n)
+    y = int((1 - math.log(math.tan(math.radians(lat)) + 1 / math.cos(math.radians(lat))) / math.pi) / 2 * n)
+    return x, y
+
+def _tile_bounds(z: int, x: int, y: int) -> tuple[float, float, float, float]:
+    n = 2 ** z
+    lon_w = x / n * 360 - 180
+    lon_e = (x + 1) / n * 360 - 180
+    lat_n = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * y / n))))
+    lat_s = math.degrees(math.atan(math.sinh(math.pi * (1 - 2 * (y + 1) / n))))
+    return lon_w, lat_s, lon_e, lat_n
+
+def _mvt_centroid(geom: dict, lon_w: float, lat_s: float, lon_e: float, lat_n: float,
+                  ext: int = 4096) -> tuple[float | None, float | None]:
+    """Centroïde WGS84 d'une géométrie MVT (Polygon ou Point) en coordonnées tuile."""
+    w, h = lon_e - lon_w, lat_n - lat_s
+    gtype = geom.get("type", "")
+    coords = geom.get("coordinates", [])
+    if gtype == "Point":
+        cx, cy = coords
+        return lon_w + cx / ext * w, lat_s + (ext - cy) / ext * h
+    if gtype in ("Polygon", "MultiPolygon"):
+        rings = coords[0] if gtype == "Polygon" else coords[0][0]
+        xs = [lon_w + c[0] / ext * w for c in rings]
+        ys = [lat_s + (ext - c[1]) / ext * h for c in rings]
+        return sum(xs) / len(xs), sum(ys) / len(ys)
+    return None, None
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _mvt_od_to_df(table: str, z: int = 12) -> pd.DataFrame:
+    """Télécharge toutes les tuiles MVT couvrant Sète et retourne un DataFrame OD."""
+    try:
+        import mapbox_vector_tile
+    except ImportError:
+        return pd.DataFrame()
+
+    lon_min, lat_min, lon_max, lat_max = _SETE_BB
+    x0, y0 = _tile_xy(lon_min, lat_max, z)
+    x1, y1 = _tile_xy(lon_max, lat_min, z)
+
+    rows: dict[int, dict] = {}
+    for tx in range(x0, x1 + 1):
+        for ty in range(y0, y1 + 1):
+            url = f"{MARTIN_URL}/{table}/{z}/{tx}/{ty}"
+            try:
+                req = urllib.request.Request(url, headers={"Accept": "application/x-protobuf"})
+                with urllib.request.urlopen(req, timeout=20) as r:
+                    raw = r.read()
+                if not raw:
+                    continue
+                dec = mapbox_vector_tile.decode(raw)
+                wb, sb, eb, nb = _tile_bounds(z, tx, ty)
+                for _layer, ldata in dec.items():
+                    for feat in ldata.get("features", []):
+                        bid = feat["properties"].get("batiment_id")
+                        if bid is None or bid in rows:
+                            continue
+                        lon, lat = _mvt_centroid(feat.get("geometry", {}), wb, sb, eb, nb)
+                        rows[bid] = {**feat["properties"], "lon": lon, "lat": lat}
+            except Exception:
+                pass
+
+    return pd.DataFrame(list(rows.values())) if rows else pd.DataFrame()
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _mvt_quartiers_df() -> pd.DataFrame:
+    """Télécharge les 7 quartiers OD depuis Martin (vue_scores_conseil_quartier_od)."""
+    try:
+        import mapbox_vector_tile
+    except ImportError:
+        return pd.DataFrame()
+
+    lon_min, lat_min, lon_max, lat_max = _SETE_BB
+    rows: dict[str, dict] = {}
+    for z in [10, 11]:
+        x0, y0 = _tile_xy(lon_min - 0.05, lat_max + 0.05, z)
+        x1, y1 = _tile_xy(lon_max + 0.05, lat_min - 0.05, z)
+        for tx in range(x0, x1 + 1):
+            for ty in range(y0, y1 + 1):
+                url = f"{MARTIN_URL}/vue_scores_conseil_quartier_od/{z}/{tx}/{ty}"
+                try:
+                    req = urllib.request.Request(url, headers={"Accept": "application/x-protobuf"})
+                    with urllib.request.urlopen(req, timeout=15) as r:
+                        raw = r.read()
+                    if not raw:
+                        continue
+                    dec = mapbox_vector_tile.decode(raw)
+                    for _layer, ldata in dec.items():
+                        for feat in ldata.get("features", []):
+                            pid = str(feat["properties"].get("poly_id", ""))
+                            if pid and pid not in rows:
+                                p = {k: v for k, v in feat["properties"].items()}
+                                p["nom_quartier"] = p.get("nom_quartier", "").strip()
+                                rows[pid] = p
+                except Exception:
+                    pass
+
+    df = pd.DataFrame(list(rows.values())) if rows else pd.DataFrame()
+    if not df.empty:
+        score_cols = [c for c in df.columns if c.startswith("score_")]
+        for c in score_cols:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+@st.cache_data(show_spinner="Chargement marche — Martin…")
 def load_gdf() -> gpd.GeoDataFrame:
-    gdf = gpd.read_file(DATA_DIR / "isochrones_walking_15min.geojson")
+    """Charge les isochrones marche 15 min depuis Martin (OD) ou le fichier local (BPE)."""
+    # ── Source 1 : Martin (OD format — 9 888 bâtiments) ─────────────────────
+    df_raw = _mvt_od_to_df("access_od_walking_15min")
+    if not df_raw.empty and len(df_raw) > 100:
+        df_raw = df_raw.dropna(subset=["lon", "lat"])
+        gdf = gpd.GeoDataFrame(
+            df_raw,
+            geometry=gpd.points_from_xy(df_raw["lon"], df_raw["lat"]),
+            crs="EPSG:4326",
+        )
+        return adapt_od_gdf(gdf)
+
+    # ── Source 2 : fichier local BPE (16 785 équipements, Tab7 disponible) ──
+    local_path = DATA_DIR / "isochrones_walking_15min.geojson"
+    if not local_path.exists():
+        st.error("Impossible de charger les isochrones marche (Martin inaccessible et fichier local absent).")
+        st.stop()
+    gdf = gpd.read_file(local_path)
     for col in gdf.select_dtypes("object").columns:
         gdf[col] = gdf[col].map(_fix)
     for col in [*FUNCTIONS, "proximite", "intermediaire", "centralite", "prioritaire"]:
@@ -662,9 +792,27 @@ def fig_missing_types_bar(df: gpd.GeoDataFrame, class_types: set) -> go.Figure:
     )
     return fig
 
-@st.cache_data
+@st.cache_data(show_spinner=False)
 def _load_od_mode(mode: str) -> gpd.GeoDataFrame | None:
-    """Charge et adapte les isochrones OD vélo/voiture si le fichier existe."""
+    """Charge les isochrones OD vélo/voiture depuis Martin, puis fichier local en fallback."""
+    martin_table = {
+        "cycling": "access_od_cycling_15min",
+        "car":     "access_od_driving_car_15min",
+    }.get(mode)
+
+    # ── Source 1 : Martin ────────────────────────────────────────────────────
+    if martin_table:
+        df_raw = _mvt_od_to_df(martin_table)
+        if not df_raw.empty and len(df_raw) > 100:
+            df_raw = df_raw.dropna(subset=["lon", "lat"])
+            gdf = gpd.GeoDataFrame(
+                df_raw,
+                geometry=gpd.points_from_xy(df_raw["lon"], df_raw["lat"]),
+                crs="EPSG:4326",
+            )
+            return adapt_od_gdf(gdf)
+
+    # ── Source 2 : fichier local ─────────────────────────────────────────────
     fname = {"cycling": "isochrones_cycling_15min.geojson",
              "car":     "isochrones_car_15min.geojson"}.get(mode)
     path = DATA_DIR / fname if fname else None
@@ -692,19 +840,17 @@ def main() -> None:
                        layout="wide", initial_sidebar_state="expanded")
     st.markdown(CSS, unsafe_allow_html=True)
 
-    # Vérification des fichiers
-    missing = [f for f in ["isochrones_walking_15min.geojson", "bpe24key_classification.csv"]
-               if not (DATA_DIR / f).exists()]
-    if missing:
-        st.error(f"Fichiers manquants dans `data/` : {', '.join(missing)}")
-        st.stop()
+    # Vérification BPE classification (seul fichier strictement requis)
+    if not (DATA_DIR / "bpe24key_classification.csv").exists():
+        st.warning("⚠️ Fichier `bpe24key_classification.csv` manquant — l'onglet Qualité données sera limité.")
 
     gdf         = load_gdf()
-    classif     = load_classif()
+    classif     = load_classif() if (DATA_DIR / "bpe24key_classification.csv").exists() else pd.DataFrame()
     gdf_cycling = _load_od_mode("cycling")
     gdf_car     = _load_od_mode("car")
     gdf_pop     = load_filosofi()
     gdf_grid    = load_grille_50m()
+    df_quartiers = _mvt_quartiers_df()
 
     # ── Sidebar ──────────────────────────────────────────────────────────────
     with st.sidebar:
@@ -831,7 +977,7 @@ def main() -> None:
     )
 
     # ── Pages (onglets) ───────────────────────────────────────────────────────
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "📍 Vue principale",
         "📊 Analyse des fonctions",
         "🏆 Score pondéré",
@@ -840,6 +986,7 @@ def main() -> None:
         "🗺️ Grille 50 m",
         "🔎 Qualité des données",
         "📖 Documentation",
+        "🏘️ Classement Quartiers",
     ])
 
     # ── Page 1 : Vue principale ───────────────────────────────────────────────
@@ -1570,6 +1717,140 @@ def main() -> None:
                     f'</div>',
                     unsafe_allow_html=True,
                 )
+
+    # ── Page 9 : Classement Quartiers ─────────────────────────────────────────
+    with tab9:
+        st.subheader("🏘️ Classement des 7 quartiers — Sète OD")
+        st.caption("Source : vue_scores_conseil_quartier_od · Martin tile server · Données Sorbonne × Chaire ETI")
+
+        if df_quartiers.empty:
+            st.warning("⚠️ Données quartiers indisponibles (Martin inaccessible). Vérifiez votre connexion.")
+        else:
+            # ── Sélecteur de mode pour le classement ──────────────────────
+            _q_mode = st.radio(
+                "Mode de transport pour le classement :",
+                ["🚶 Marche 15 min", "🚴 Vélo 15 min", "🚗 Voiture 15 min"],
+                horizontal=True, key="q_mode_radio",
+            )
+            _q_col = {
+                "🚶 Marche 15 min": "score_hqvs_moyen",
+                "🚴 Vélo 15 min":   "score_cycling_15_moyen",
+                "🚗 Voiture 15 min": "score_driving_car_15_moyen",
+            }[_q_mode]
+
+            # Calcul du score moyen par mode (moy des 6 bouquets)
+            _bouquets_keys = list(FUNCTIONS.keys())
+            _q_mode_prefix = {
+                "🚶 Marche 15 min":   "score_walking_15",
+                "🚴 Vélo 15 min":     "score_cycling_15",
+                "🚗 Voiture 15 min":  "score_driving_car_15",
+            }[_q_mode]
+
+            _score_cols = [f"{_q_mode_prefix}_{b}" for b in _bouquets_keys
+                           if f"{_q_mode_prefix}_{b}" in df_quartiers.columns]
+            if _score_cols:
+                df_quartiers["_score_mode"] = df_quartiers[_score_cols].mean(axis=1)
+            elif "score_hqvs_moyen" in df_quartiers.columns:
+                df_quartiers["_score_mode"] = pd.to_numeric(df_quartiers["score_hqvs_moyen"], errors="coerce")
+            else:
+                df_quartiers["_score_mode"] = 0.0
+
+            dq = df_quartiers.copy()
+            dq = dq.sort_values("_score_mode", ascending=True)
+            noms = dq["nom_quartier"].tolist()
+            scores = dq["_score_mode"].round(2).tolist()
+            colors_bar = [score_color(s) for s in scores]
+
+            # ── Graphique barre horizontal ──────────────────────────────────
+            fig_q = go.Figure()
+            fig_q.add_trace(go.Bar(
+                x=scores, y=noms,
+                orientation="h",
+                marker_color=colors_bar,
+                text=[f"<b>{s:.2f}</b>" for s in scores],
+                textposition="outside",
+                hovertemplate="<b>%{y}</b><br>Score : %{x:.2f}/10<extra></extra>",
+            ))
+            fig_q.update_layout(
+                title=f"Score HQVS — {_q_mode}",
+                xaxis=dict(range=[0, 10], title="Score /10", gridcolor="#e2e8f0"),
+                yaxis=dict(title=""),
+                height=380, margin=dict(l=160, r=60, t=40, b=40),
+                **PLOTLY_LAYOUT,
+            )
+            st.plotly_chart(fig_q, use_container_width=True)
+
+            # ── Tableau comparatif 3 modes ─────────────────────────────────
+            st.subheader("Scores HQVS par mode de transport")
+            _modes_cfg = [
+                ("🚶 Marche 15 min",  "score_walking_15"),
+                ("🚴 Vélo 15 min",    "score_cycling_15"),
+                ("🚗 Voiture 15 min", "score_driving_car_15"),
+            ]
+            _tbl_rows = []
+            for _, row in dq.sort_values("_score_mode", ascending=False).iterrows():
+                nom = row["nom_quartier"]
+                r = {"Quartier": nom, "Population": f"{int(row.get('pop_batiments', 0)):,}".replace(",", " ")}
+                for lbl, pfx in _modes_cfg:
+                    cols_b = [f"{pfx}_{b}" for b in _bouquets_keys if f"{pfx}_{b}" in row.index]
+                    val = round(float(pd.Series([row[c] for c in cols_b]).mean()), 2) if cols_b else None
+                    r[lbl] = f"{val:.2f}" if val is not None else "—"
+                _tbl_rows.append(r)
+            st.dataframe(pd.DataFrame(_tbl_rows), use_container_width=True, hide_index=True)
+
+            # ── Radar comparatif des 6 fonctions par quartier ──────────────
+            st.subheader(f"Radar HQVS par quartier — {_q_mode}")
+            _func_labels = [f"{FUNCTIONS[k][1]} {FUNCTIONS[k][0]}" for k in _bouquets_keys]
+            _func_cols   = [f"{_q_mode_prefix}_{k}" for k in _bouquets_keys
+                            if f"{_q_mode_prefix}_{k}" in df_quartiers.columns]
+
+            if _func_cols:
+                fig_radar_q = go.Figure()
+                palette = ["#2563eb","#7c3aed","#059669","#ef4444","#f59e0b","#db2777","#0ea5e9"]
+                for i, (_, row) in enumerate(df_quartiers.iterrows()):
+                    vals = [float(row.get(c, 0)) for c in _func_cols]
+                    vals_c = vals + [vals[0]]
+                    lbl_c  = _func_labels + [_func_labels[0]]
+                    fig_radar_q.add_trace(go.Scatterpolar(
+                        r=vals_c, theta=lbl_c,
+                        fill="toself", opacity=0.25,
+                        line=dict(color=palette[i % len(palette)], width=2),
+                        name=row["nom_quartier"],
+                    ))
+                fig_radar_q.update_layout(
+                    polar=dict(
+                        radialaxis=dict(visible=True, range=[0, 10],
+                            tickvals=[2, 4, 6, 8, 10],
+                            gridcolor="#e2e8f0", linecolor="#e2e8f0"),
+                        angularaxis=dict(gridcolor="#e2e8f0"),
+                        bgcolor="rgba(248,250,252,0.8)",
+                    ),
+                    height=450, margin=dict(l=70, r=70, t=40, b=40),
+                    **PLOTLY_LAYOUT,
+                )
+                st.plotly_chart(fig_radar_q, use_container_width=True)
+
+            # ── Détail scores par fonction ─────────────────────────────────
+            with st.expander("📋 Détail complet — Scores par fonction et par mode"):
+                _detail_cols = ["nom_quartier", "nb_batiments", "pop_batiments"] + \
+                    [f"score_{k}" for k in _bouquets_keys if f"score_{k}" in df_quartiers.columns] + \
+                    [f"score_walking_15_{k}" for k in _bouquets_keys if f"score_walking_15_{k}" in df_quartiers.columns] + \
+                    [f"score_cycling_15_{k}" for k in _bouquets_keys if f"score_cycling_15_{k}" in df_quartiers.columns] + \
+                    [f"score_driving_car_15_{k}" for k in _bouquets_keys if f"score_driving_car_15_{k}" in df_quartiers.columns]
+                _detail_cols = [c for c in _detail_cols if c in df_quartiers.columns]
+                _df_detail = df_quartiers[_detail_cols].copy()
+                _df_detail.columns = [
+                    c.replace("nom_quartier", "Quartier")
+                    .replace("nb_batiments", "Bâtiments")
+                    .replace("pop_batiments", "Population")
+                    .replace("score_walking_15_", "🚶 ")
+                    .replace("score_cycling_15_", "🚴 ")
+                    .replace("score_driving_car_15_", "🚗 ")
+                    .replace("score_", "📊 ")
+                    for c in _detail_cols
+                ]
+                st.dataframe(_df_detail.round(2), use_container_width=True, hide_index=True)
+
 
 if __name__ == "__main__":
     main()
